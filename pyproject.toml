@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-spaceclaim"
+dynamic = ["version"]
+description = "MCP server for Ansys SpaceClaim and Discovery: model, inspect and export CAD geometry from Claude or any MCP client"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.14"
+authors = [{ name = "Nesso Labs" }]
+keywords = ["mcp", "spaceclaim", "ansys", "cad", "pyansys", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mcp>=2.3,<3",
+    "ansys-geometry-core>=0.18,<0.19",
+    # Body.tessellate() returns pyvista meshes; the images themselves are drawn
+    # with matplotlib (pulled in by ansys-geometry-core), so no OpenGL is needed.
+    "pyvista>=0.44,<1",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "anyio>=4",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/nesso-labs/mcp-spaceclaim"
+Issues = "https://github.com/nesso-labs/mcp-spaceclaim/issues"
+
+[project.scripts]
+mcp-spaceclaim = "mcp_spaceclaim.cli:main"
+
+[tool.hatch.version]
+path = "src/mcp_spaceclaim/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_spaceclaim"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: needs a running SpaceClaim/Discovery/Geometry service (set SPACECLAIM_MCP_LIVE=1)",
+]
