@@ -118,6 +118,31 @@ def test_l_bracket_end_to_end(tmp_path):
             fillet_loss = 2 * (6**2 - math.pi * 6**2 / 4) * 5
             assert final == pytest.approx(after_holes - fillet_loss, rel=1e-5)
 
+            # A full revolve: PyAnsys implements it as a sweep and only tests 90 degrees
+            # upstream. Washer: outer R 12, inner R 6, 3 thick, revolved about Z.
+            washer = await data(
+                "revolve_sketch",
+                {
+                    "name": "Washer",
+                    "shapes": [{"type": "box", "center": [9, 101.5], "width": 6, "height": 3}],
+                    "plane": {"base": "XZ"},
+                    "axis_origin": [0, 0, 0],
+                    "axis": "Z",
+                    "angle": 360,
+                },
+            )
+            expected = math.pi * (12**2 - 6**2) * 3
+            assert washer["changes"]["created"][0]["volume"] == pytest.approx(expected, rel=1e-5)
+
+            await data(
+                "create_named_selection",
+                {
+                    "name": "mounting_holes",
+                    "body": base_id,
+                    "face_ids": [f["id"] for f in holes["faces"]],
+                },
+            )
+
             picture = await ok("render_view", {"views": ["iso", "top"], "size": 600})
             assert picture.content[0].type == "image"
 

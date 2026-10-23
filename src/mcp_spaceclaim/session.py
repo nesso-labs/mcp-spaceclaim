@@ -58,6 +58,7 @@ class Session:
     design: Any = None
     product: str | None = None
     launched: bool = False
+    host: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     # --- connection -------------------------------------------------------------
@@ -65,6 +66,19 @@ class Session:
     @property
     def connected(self) -> bool:
         return self.modeler is not None
+
+    @property
+    def is_local(self) -> bool:
+        """The product runs on this machine, so it can read our file paths directly."""
+        return self.launched or (self.host or "").lower() in ("localhost", "127.0.0.1", "::1")
+
+    @property
+    def has_product_ui(self) -> bool:
+        """SpaceClaim or Discovery (with their scripting API), not a headless service."""
+        if self.product in ("spaceclaim", "discovery"):
+            return True
+        kind = _safe(lambda: self.modeler.client.backend_type.name, default="")
+        return kind in ("SPACECLAIM", "DISCOVERY")
 
     def launch(self, product: Product, version: int | None, hidden: bool, timeout: int) -> None:
         """Start a new product instance with the ApiServer add-in and connect to it."""
@@ -78,11 +92,12 @@ class Session:
         kwargs: dict[str, Any] = {"version": version, "timeout": timeout}
         if product in ("spaceclaim", "discovery"):
             kwargs["hidden"] = hidden
-            # The launcher defaults the add-in API to the newest one PyAnsys knows (27.2),
-            # which an older product rejects. Pin it to the product's own release.
+            # The launcher defaults the add-in API to the newest one PyAnsys knows (27.2).
+            # Ask for the product's own release instead, passed as the plain number the
+            # way PyAnsys' own launcher tests do.
             api = _api_version(version)
             if api is not None:
-                kwargs["api_version"] = api
+                kwargs["api_version"] = api.value
         launcher = {
             "spaceclaim": launch_modeler_with_spaceclaim,
             "discovery": launch_modeler_with_discovery,
@@ -91,6 +106,7 @@ class Session:
         self.modeler = launcher(**kwargs)
         self.product = product
         self.launched = True
+        self.host = "localhost"
         self._check_backend()
 
     def attach(self, host: str, port: int, transport_mode: str | None) -> None:
@@ -104,6 +120,7 @@ class Session:
         self.modeler = Modeler(**kwargs)
         self.product = "attached"
         self.launched = False
+        self.host = host
         self._check_backend()
         # Pick up the document the user already has open, if any.
         self.design = _safe(self.modeler.read_existing_design)
@@ -125,6 +142,7 @@ class Session:
             self.design = None
             self.product = None
             self.launched = False
+            self.host = None
 
     def _check_backend(self) -> None:
         version = self.backend_version

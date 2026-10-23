@@ -161,6 +161,32 @@ def test_a_cut_that_changes_nothing_is_an_error(server, modeler):
     assert "no_geometry_change" in msg
 
 
+def test_a_cut_that_misses_is_refused_and_cleaned_up(server, modeler):
+    modeler.design.add_block("Far", [500, 500, 500], [510, 510, 510])
+    msg = error(
+        server,
+        "create_cylinder",
+        {
+            "name": "Drill",
+            "base_center": [0, 0, 0],
+            "radius": 3,
+            "height": 5,
+            "operation": "cut",
+            "targets": ["Far"],
+        },
+    )
+    assert "does not touch" in msg
+    assert [b.name for b in modeler.design.bodies] == ["Far"]
+
+
+def test_boolean_with_disjoint_tool_is_refused(server, modeler):
+    modeler.design.add_block("A", [0, 0, 0], [1, 1, 1])
+    modeler.design.add_block("B", [5, 5, 5], [6, 6, 6])
+    msg = error(server, "boolean", {"operation": "subtract", "target": "A", "tools": ["B"]})
+    assert "does not touch" in msg
+    assert len(modeler.design.bodies) == 2
+
+
 def test_operation_add_needs_targets(server):
     msg = error(
         server,
@@ -294,7 +320,7 @@ def test_measure_distance(server, modeler):
     modeler.design.add_block("A", [0, 0, 0], [1, 1, 1])
     modeler.design.add_block("B", [5, 0, 0], [6, 1, 1])
     out = ok(server, "measure_distance", {"body_a": "A", "body_b": "B"})
-    assert out == {"distance": pytest.approx(4.2), "collision": "intersect", "units": "mm"}
+    assert out == {"distance": pytest.approx(4.2), "collision": "none", "units": "mm"}
 
 
 # --- output ---------------------------------------------------------------------------
@@ -325,6 +351,42 @@ def test_save_picks_format_from_extension(server, modeler, tmp_path):
     assert Path(out["path"]) == tmp_path / "part.step"
     assert modeler.design.calls[-1][2] == "STEP"
     assert "unsupported extension" in error(server, "save_design", {"path": "part.docx"})
+
+
+def test_step_without_api_export_refuses_on_a_remote_product(server, modeler):
+    modeler.design.add_block("Block", [0, 0, 0], [10, 10, 10])
+
+    def no_step(path, fmt):
+        raise RuntimeError("STEP export needs 27.1")
+
+    modeler.design.download = no_step
+    # The fixture session has no host: the product's own save would write on its machine.
+    assert "remote product" in error(server, "save_design", {"path": "part.step"})
+
+
+def test_step_fallback_on_a_local_product(modeler, tmp_path):
+    modeler.design.add_block("Block", [0, 0, 0], [10, 10, 10])
+    modeler.design.download = lambda path, fmt: (_ for _ in ()).throw(RuntimeError("27.1"))
+    session = Session(modeler=modeler, design=modeler.design, host="localhost")
+    srv = build_server(Config(output_dir=str(tmp_path)), session=session)
+    out = ok(srv, "save_design", {"path": "part.step"})
+    assert out["via"] == "product save"
+    assert (tmp_path / "part.step").read_bytes().startswith(b"ISO-10303-21")
+    assert not list(tmp_path.glob("*.mcp-partial*"))
+
+
+def test_empty_export_is_an_error(server, modeler, tmp_path):
+    modeler.design.add_block("Block", [0, 0, 0], [10, 10, 10])
+    modeler.design.download = lambda path, fmt: Path(path).write_bytes(b"")
+    assert "produced no file" in error(server, "save_design", {"path": "part.x_t"})
+
+
+def test_shell_goes_inward_by_default(server, modeler):
+    body = modeler.design.add_block("Box", [0, 0, 0], [10, 10, 10])
+    ok(server, "shell_body", {"body": "Box", "thickness": 1.5})
+    assert body.calls[-1] == ("shell", pytest.approx(-1.5))
+    ok(server, "shell_body", {"body": "Box", "thickness": 1.5, "side": "outward"})
+    assert body.calls[-1] == ("shell", pytest.approx(1.5))
 
 
 def test_save_stl_from_tessellation(server, modeler, tmp_path):

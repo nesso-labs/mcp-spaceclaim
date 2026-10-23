@@ -211,6 +211,7 @@ class FakeBody:
                 self.design.delete_body(o)
 
     def shell_body(self, offset):
+        self.calls.append(("shell", offset.value.m_as(UNITS.mm)))
         self.volume_m3 *= 0.5
         return True
 
@@ -220,7 +221,17 @@ class FakeBody:
         return True
 
     def get_collision(self, other):
-        return SimpleNamespace(name="INTERSECT")
+        overlap = all(
+            a_lo <= b_hi and b_lo <= a_hi
+            for a_lo, a_hi, b_lo, b_hi in zip(self.lo, self.hi, other.lo, other.hi, strict=True)
+        )
+        if not overlap:
+            return SimpleNamespace(name="NONE")
+        strict = all(
+            a_lo < b_hi and b_lo < a_hi
+            for a_lo, a_hi, b_lo, b_hi in zip(self.lo, self.hi, other.lo, other.hi, strict=True)
+        )
+        return SimpleNamespace(name="INTERSECT" if strict else "TOUCH")
 
     def tessellate(self, merge=True):
         lo, hi = self.lo, self.hi
@@ -347,7 +358,11 @@ class FakeModeler:
         return self.design
 
     def run_script_file(self, path, script_args=None, import_design=False):
-        self.scripts.append((Path(path).read_text(), script_args))
+        code = Path(path).read_text()
+        self.scripts.append((code, script_args))
+        if "DocumentSave.Execute" in code:  # the server's in-product Save As
+            Path(script_args["path"]).write_bytes(b"ISO-10303-21; fake")
+            return {"saved": script_args["path"]}, None
         self.design.add_block("FromScript", [0, 0, 0], [1, 1, 1])
         return {"ok": "1"}, self.design if import_design else None
 

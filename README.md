@@ -27,7 +27,7 @@ trademarks of ANSYS, Inc.
 | Area | Tools |
 |---|---|
 | Session | `spaceclaim_connect` (launch or attach), `spaceclaim_status`, `spaceclaim_disconnect` |
-| Documents | `new_design`, `open_file` (SCDOCX, STEP, Parasolid, IGES, ...), `save_design` (`.scdocx` `.step` `.x_t` `.x_b` `.igs` `.fmd` `.pmdb` `.dsco` `.stl`) |
+| Documents | `new_design`, `open_file` (SCDOCX, STEP, Parasolid, IGES, ...), `save_design` (`.scdocx` `.step` `.x_t` `.x_b` `.igs` `.fmd` `.pmdb` `.stl`) |
 | Sketch + solid | `sketch_extrude`, `revolve_sketch` (boxes, circles, regular polygons, slots, ellipses, polylines, line/arc paths, on a principal plane or on a planar face), `create_box`, `create_cylinder`, `create_sphere`. Each one can make a new body, `add` to bodies or `cut` from them |
 | Edit | `boolean` (unite/subtract/intersect), `move_body` (translate/rotate/mirror, optionally as a copy), `pattern_body` (linear/circular), `fillet_edges`, `chamfer_edges`, `pull_faces` (SpaceClaim *Pull*), `shell_body`, `rename_body`, `delete_body`, `create_named_selection` (for Fluent/Mechanical) |
 | Inspect | `list_bodies`, `describe_body`, `select_faces` / `select_edges` (select by type, normal, radius, length or position, e.g. "the top face", "the Ø8 holes", "the vertical edges"), `measure_distance` |
@@ -44,6 +44,11 @@ How it keeps the model honest:
   build on a step that did not happen.
 - **One working unit** for every number in and out (millimetres by default), and degrees
   for angles. PyAnsys works in metres internally.
+- **Booleans that cannot work are refused up front.** A cut or union with a body it
+  does not touch would delete the tool body and leave the target unchanged, so the
+  server checks for contact first.
+- **Failed edits clean up after themselves.** Tool bodies and the temporary copies
+  PyAnsys makes for booleans are removed when an operation fails.
 - **Errors keep their message.** SpaceClaim's own error text reaches the model, instead
   of the SDK's generic "Error executing tool".
 
@@ -124,6 +129,25 @@ Sketch planes (`plane.base`) and what "+" extrudes along:
 used. Bodies are referenced by id, or by name when the name is unique. Face and edge ids
 can change after a topology edit, so select them again rather than reusing old ones.
 
+## Known limitations on 2025 R2
+
+These come from the PyAnsys Geometry 0.18 sources and its own list of backend
+incompatibilities, not from a live run:
+
+- **STEP/IGES export through the API needs 2027 R1.** On older releases `save_design`
+  falls back to SpaceClaim's own Save As (`DocumentSave`) inside the product, which works
+  only when the product runs on the same machine as the server. The result says which
+  path was used (`via`). `.scdocx` and Parasolid `.x_t` do not need the fallback.
+- **Importing files** (`open_file`) had problems before 26.1, according to the PyAnsys
+  test suite.
+- **Bodies inside sub-components** (typical in imported assemblies) are instances of a
+  master body. A move applies to the master, so every instance moves, and `shell_body`
+  with `open_faces` is refused for them.
+- `pull_faces` is proven on planar faces only. To resize a hole, cut a larger cylinder.
+- `revolve_sketch` is built as a sweep by PyAnsys. The live test checks a full 360°
+  revolve; upstream tests only cover 90°.
+- `shell_body` hollows inward by default (`side: "outward"` keeps the inner size).
+
 ## Safety
 
 - `new_design` and `open_file` close the current document. `delete_body` and
@@ -142,8 +166,9 @@ uv run pytest                 # unit tests: real PyAnsys client objects + fake b
 uv run ruff check src tests
 ```
 
-Live end-to-end test (Windows + SpaceClaim). It builds the bracket above, checks every
-volume against the hand-computed value, renders it and exports STEP/SCDOCX/STL:
+Live end-to-end test (Windows + SpaceClaim). It builds the bracket above and a revolved
+washer, checks every volume against the hand-computed value, adds a named selection,
+renders the result and exports STEP/SCDOCX/STL:
 
 ```powershell
 $env:SPACECLAIM_MCP_LIVE = "1"

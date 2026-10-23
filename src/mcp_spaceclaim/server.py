@@ -145,7 +145,11 @@ def build_server(config: Config | None = None, session: Session | None = None) -
         """
         with session.lock:
             before = session.snapshot(focus)
-            extra = op() or {}
+            try:
+                extra = op() or {}
+            except Exception:
+                _discard_new_bodies(session, set(before))
+                raise
             after = session.snapshot(focus)
             created = [i for i in after if i not in before]
             if created:
@@ -255,7 +259,9 @@ def build_server(config: Config | None = None, session: Session | None = None) -
             raise ToolError(f"file not found: {file}")
         with session.lock:
             modeler = session.require_modeler()
-            session.design = modeler.open_file(str(file))
+            # Uploading is for remote backends; for multi-file formats it also sends the
+            # whole folder and fails on any subfolder.
+            session.design = modeler.open_file(str(file), upload_to_server=not session.is_local)
             return {"design": session.design.name, "bodies": _bodies_summary(session)}
 
     @tool(EDIT)
@@ -264,40 +270,64 @@ def build_server(config: Config | None = None, session: Session | None = None) -
             str,
             Field(
                 description="Target file; the extension picks the format: .scdocx, .step/.stp, "
-                ".x_t/.x_b (Parasolid), .igs, .fmd, .pmdb, .dsco, or .stl (tessellated). "
+                ".x_t/.x_b (Parasolid), .igs, .fmd, .pmdb, or .stl (tessellated). "
                 "A relative path is placed under the server's output folder."
             ),
         ],
     ) -> dict[str, Any]:
-        """Save or export the active design."""
+        """Save or export the active design. An existing file is replaced."""
         target = Path(path).expanduser()
         if not target.is_absolute():
             target = out_dir / target
-        target.parent.mkdir(parents=True, exist_ok=True)
         ext = target.suffix.lower().lstrip(".")
+        fmt = None
+        if ext != "stl":
+            from ansys.geometry.core.designer.design import DESIGN_FILE_FORMAT_EXTENSIONS
+
+            fmt = next(
+                (
+                    f
+                    for f, exts in DESIGN_FILE_FORMAT_EXTENSIONS.items()
+                    if ext in exts and f.name != "INVALID"
+                ),
+                None,
+            )
+            if fmt is None:
+                raise ToolError(f"unsupported extension .{ext}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Write next to the target and move it into place, so a stale file from an
+        # earlier save can never pass for this one.
+        partial = target.with_name(f"{target.stem}.mcp-partial{target.suffix}")
+        partial.unlink(missing_ok=True)
+        via = "pyansys"
         with session.lock:
             design = session.require_design()
-            if ext == "stl":
-                _export_stl(session, target)
+            if fmt is None:
+                _export_stl(session, partial)
+                via = "tessellation"
             else:
-                from ansys.geometry.core.designer.design import (
-                    DESIGN_FILE_FORMAT_EXTENSIONS,
-                )
-
-                fmt = next(
-                    (
-                        f
-                        for f, exts in DESIGN_FILE_FORMAT_EXTENSIONS.items()
-                        if ext in exts and f.name != "INVALID"
-                    ),
-                    None,
-                )
-                if fmt is None:
-                    raise ToolError(f"unsupported extension .{ext}")
-                design.download(target, fmt)
-        if not target.exists():
-            raise ToolError(f"the backend reported success but {target} was not written")
-        return {"path": str(target), "bytes": target.stat().st_size}
+                error: Exception | None = None
+                try:
+                    design.download(partial, fmt)
+                except Exception as exc:
+                    error = exc
+                if not _written(partial) and ext in PRODUCT_SAVE and session.has_product_ui:
+                    # PyAnsys' STEP/IGES export needs 2027 R1; on older releases save
+                    # through the product's own Save As instead.
+                    if not session.is_local:
+                        raise ToolError(
+                            f"STEP/IGES export is not available through the API on this "
+                            f"release, and the remote product cannot write {partial} here; "
+                            "save as .scdocx or .x_t, or run the server on the CAD machine"
+                        )
+                    _save_in_product(session, partial)
+                    via = "product save"
+                if not _written(partial):
+                    partial.unlink(missing_ok=True)
+                    detail = f": {error}" if error else ""
+                    raise ToolError(f"export to .{ext} produced no file{detail}")
+        partial.replace(target)
+        return {"path": str(target), "bytes": target.stat().st_size, "via": via}
 
     # ---------------------------------------------------------------------------------
     # inspection
@@ -510,6 +540,10 @@ def build_server(config: Config | None = None, session: Session | None = None) -
     # ---------------------------------------------------------------------------------
 
     def _plane(plane: PlaneSpec):
+        with session.lock:  # reads the face from the backend
+            return _plane_unlocked(plane)
+
+    def _plane_unlocked(plane: PlaneSpec):
         if plane.face_id:
             if not plane.body:
                 raise ToolError("plane.body is required with plane.face_id")
@@ -543,20 +577,17 @@ def build_server(config: Config | None = None, session: Session | None = None) -
         # Booleans re-read the design, so look every body up again by id before each call
         # instead of reusing objects that may belong to the previous tree.
         ids = [t.id for t in target_bodies]
-        try:
-            if operation == "add":
-                keep = session.body(ids[0])
-                keep.unite([session.body(new.id), *[session.body(i) for i in ids[1:]]])
-                return {"body": {"id": keep.id, "name": keep.name}}
-            for n, tid in enumerate(ids):
-                session.body(tid).subtract(session.body(new.id), keep_other=n < len(ids) - 1)
-            return {"cut_from": ids}
-        except Exception:
-            # Do not leave the tool body behind as a stray solid.
-            leftover = [b for b in session.bodies() if b.id == new.id]
-            for b in leftover:
-                _safe(lambda b=b: b.parent_component.delete_body(b))
-            raise
+        # A boolean with a body it does not touch "succeeds" by deleting the tool and
+        # leaving the target as it was, so refuse those up front (track() then removes
+        # the tool body we just made).
+        _require_contact(session.body(new.id), [session.body(i) for i in ids], name)
+        if operation == "add":
+            keep = session.body(ids[0])
+            keep.unite([session.body(new.id), *[session.body(i) for i in ids[1:]]])
+            return {"body": {"id": keep.id, "name": keep.name}}
+        for n, tid in enumerate(ids):
+            session.body(tid).subtract(session.body(new.id), keep_other=n < len(ids) - 1)
+        return {"cut_from": ids}
 
     Operation = Annotated[
         Literal["new", "add", "cut"],
@@ -711,10 +742,19 @@ def build_server(config: Config | None = None, session: Session | None = None) -
             others = [session.body(r) for r in tools]
             if any(o.id == t.id for o in others):
                 raise ToolError("target must not be one of the tools")
+            _require_contact(t, others, "the tool bodies")
             getattr(t, operation)(others, keep_other=keep_tools and operation != "unite")
             return {"target": t.id}
 
-        return track(op, _focus(session, [target, *tools]))
+        with session.lock:
+            result = track(op, _focus(session, [target, *tools]))
+            target_id = result["target"]
+            if not any(m["id"] == target_id for m in result["changes"]["modified"]):
+                raise ToolError(
+                    f"no_geometry_change: {operation} left the target {target_id} unchanged "
+                    f"(changes: {result['changes']})"
+                )
+            return result
 
     @tool(EDIT)
     def move_body(
@@ -737,7 +777,13 @@ def build_server(config: Config | None = None, session: Session | None = None) -
                 if copy:
                     b = b.copy(b.parent_component, f"{b.name}_copy")
                 _transform(b, translate, rotate, mirror, units)
-                moved.append({"id": b.id, "name": b.name})
+                entry = {"id": b.id, "name": b.name}
+                if "/" in b.id:
+                    entry["note"] = (
+                        "body lives in a sub-component: the transform applies to its master "
+                        "body, so every instance of that component moves"
+                    )
+                moved.append(entry)
             return {"bodies": moved}
 
         # A move shows up as a bounding-box change, but rotating a cylinder about its own
@@ -833,8 +879,8 @@ def build_server(config: Config | None = None, session: Session | None = None) -
             ),
         ],
     ) -> dict[str, Any]:
-        """SpaceClaim Pull: offset faces to change a size (make a plate thicker, deepen a
-        pocket, enlarge a hole)."""
+        """SpaceClaim Pull: offset planar faces to change a size (make a plate thicker,
+        deepen a pocket). To resize a hole, cut a larger cylinder instead."""
         from ansys.geometry.core.designer.geometry_commands import ExtrudeType, OffsetMode
 
         if distance == 0:
@@ -868,15 +914,26 @@ def build_server(config: Config | None = None, session: Session | None = None) -
         open_faces: Annotated[
             list[str] | None, Field(description="Faces to remove, leaving an open shell.")
         ] = None,
+        side: Annotated[
+            Literal["inward", "outward"],
+            Field(description="inward keeps the outer size; outward keeps the inner size."),
+        ] = "inward",
     ) -> dict[str, Any]:
         """Hollow a solid to a wall thickness, optionally opening some faces."""
+        # PyAnsys offsets along the outward normal: a positive value grows the part.
+        offset = -thickness if side == "inward" else thickness
 
         def op():
             b = session.body(body)
             if open_faces:
-                ok = b.remove_faces(session.faces(body, open_faces), units.distance(thickness))
+                if "/" in b.id:
+                    raise ToolError(
+                        f"{b.name} sits in a sub-component; PyAnsys cannot open faces of "
+                        "instanced bodies. Use run_script, or shell without open_faces."
+                    )
+                ok = b.remove_faces(session.faces(body, open_faces), units.distance(offset))
             else:
-                ok = b.shell_body(units.distance(thickness))
+                ok = b.shell_body(units.distance(offset))
             if not ok:
                 raise ToolError("shell failed: thickness too large for the body?")
 
@@ -947,11 +1004,10 @@ def build_server(config: Config | None = None, session: Session | None = None) -
 
             def op():
                 modeler = session.require_modeler()
-                result, design = modeler.run_script_file(
-                    path, script_args=args or {}, import_design=True
-                )
-                if design is not None:
-                    session.design = design
+                result, _ = modeler.run_script_file(path, script_args=args or {})
+                # Re-read separately: with import_design=True a script that leaves no
+                # document open would raise after it ran, and its result would be lost.
+                session.design = _safe(modeler.read_existing_design) or session.design
                 return {"result": result}
 
             with session.lock:
@@ -965,6 +1021,34 @@ def build_server(config: Config | None = None, session: Session | None = None) -
 
 
 # --- helpers ---------------------------------------------------------------------------
+
+
+def _require_contact(tool, targets: list, tool_name: str) -> None:
+    misses = [t for t in targets if _collision(tool, t) == "none"]
+    if misses:
+        names = ", ".join(f"{t.name} ({t.id})" for t in misses)
+        raise ToolError(
+            f"{tool_name} does not touch {names}: nothing to unite with or cut. Check the "
+            "sketch plane, offset and direction (render_view helps)."
+        )
+
+
+def _collision(a, b) -> str | None:
+    kind = _safe(lambda: a.get_collision(b))
+    return None if kind is None else kind.name.lower()
+
+
+def _discard_new_bodies(session: Session, known: set[str]) -> None:
+    """After a failed edit, delete bodies it created (tool bodies, BoolOpCopy_* copies).
+
+    A failing boolean raises after PyAnsys has already copied the tool bodies, and
+    skips its own design refresh, so re-read the design first.
+    """
+    _safe(session.refresh_design)
+    for b in _safe(session.bodies, default=[]):
+        if b.id not in known:
+            log.info("removing %s (%s) left behind by a failed edit", b.name, b.id)
+            _safe(lambda b=b: b.parent_component.delete_body(b))
 
 
 def _focus(session: Session, refs: list[str] | None) -> list[str] | None:
@@ -1004,6 +1088,26 @@ def _transform(body, translate, rotate, mirror, units: Units) -> None:
         body.mirror(
             Plane(origin=tmp.origin, direction_x=tmp.direction_x, direction_y=tmp.direction_y)
         )
+
+
+PRODUCT_SAVE = {"stp", "step", "igs"}
+
+_SAVE_SCRIPT = """\
+options = ExportOptions.Create()
+DocumentSave.Execute(argsDict["path"], options)
+result = {"saved": argsDict["path"]}
+"""
+
+
+def _save_in_product(session: Session, path: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "mcp_save.py"
+        script.write_text(_SAVE_SCRIPT, encoding="utf-8")
+        session.require_modeler().run_script_file(script, script_args={"path": str(path)})
+
+
+def _written(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
 
 
 def _export_stl(session: Session, target: Path) -> None:
@@ -1075,10 +1179,15 @@ def _face_info(units: Units, f) -> dict[str, Any]:
         n = _safe(f.normal)
         if n is not None:
             info["normal"] = [round(float(c), 6) for c in n]
-    if kind in ("cylinder", "cone", "sphere", "torus"):
+    if kind in ("cylinder", "cone", "sphere"):
         r = _safe(lambda: f.shape.geometry.radius)
         if r is not None:
             info["radius"] = units.length_out(r)
+    if kind == "torus":
+        for key in ("major_radius", "minor_radius"):
+            r = _safe(lambda key=key: getattr(f.shape.geometry, key))
+            if r is not None:
+                info[key] = units.length_out(r)
     if kind == "cylinder":
         ax = _safe(lambda: f.shape.geometry.dir_z)
         if ax is not None:
